@@ -53,7 +53,7 @@ from optimizers import get_optimizer
 from optimizers.hessian_scheduler import ConstantScheduler, ProportionScheduler, LinearScheduler, CosineScheduler
 
 # import wandb
-wandb_log = True
+wandb_log = False
 
 # for sam
 from bypass_bn import enable_running_stats, disable_running_stats
@@ -158,6 +158,8 @@ parser.add_argument('--project_name', type=str, default='project_name', help="pr
 parser.add_argument('--out-dir', type=str, default='runs', help='output directory for logs/plots')
 parser.add_argument('--run-tag', type=str, default='', help='optional tag to add to run folder name')
 parser.add_argument('--log-steps', action='store_true', help='log step-level train/test metrics (batch-wise)')
+parser.add_argument("--hvp_every", default=1, type=int, help="Compute HVP correction every k steps (k>=1).")
+parser.add_argument("--hvp_mode", default="skip", type=str, choices=["skip", "reuse"], help="On non-HVP steps: skip or reuse cached projector term.")
 
 best_acc1 = 0
 
@@ -256,7 +258,7 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         # [NEW if branch]
         if args.optimizer in ['samsgd', 'samadamw']:
-            model = model.cuda()
+            model = model.to(device)
         else:
             # DataParallel will divide and allocate batch_size to all available GPUs
             if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):

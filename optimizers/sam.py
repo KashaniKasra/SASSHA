@@ -3,8 +3,9 @@ import torch
 
 # [CHANGED]
 class SAM(torch.optim.Optimizer):
-    def __init__(self, model, base_optimizer, rho=0.05, adaptive=False, **kwargs):
+    def __init__(self, model, base_optimizer, rho=0.05, adaptive=False, hvp_every=1, **kwargs):
         assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
+        assert hvp_every >= 1, f"Invalid hvp_every, should be >= 1: {hvp_every}"
 
         self.model = model
         self.param_names = []
@@ -14,13 +15,15 @@ class SAM(torch.optim.Optimizer):
                 self.param_names.append(name)
                 params.append(p)
 
-        defaults = dict(rho=rho, adaptive=adaptive, **kwargs)
+        defaults = dict(rho=rho, adaptive=adaptive, hvp_every=hvp_every, **kwargs)
         super().__init__(params, defaults)
 
         self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
         self.param_groups = self.base_optimizer.param_groups
         self.defaults.update(self.base_optimizer.defaults)
-    
+        self._global_step = 0
+        self._cached_proj = None
+
     # Dot product <a, b> across param tensors
     def _global_dot(self, a_list, b_list):
         s = None
@@ -140,18 +143,25 @@ class SAM(torch.optim.Optimizer):
         )
         v = [vi if vi is not None else (pp * 0.0) for pp, vi in zip(perturbed_params, v)]
 
-        # 4) Hv = H(w) v 
-        Hv = torch.autograd.grad(
-            g, params,
-            grad_outputs=v,
-            create_graph=False,
-            retain_graph=False,
-            allow_unused=True
-        )
-        Hv = [hvi if hvi is not None else (p * 0.0) for p, hvi in zip(params, Hv)]
+        self._global_step += 1
+        group0 = self.param_groups[0]
+        hvp_every = int(group0.get("hvp_every", 1))
+        do_hvp = (hvp_every <= 1) or (self._global_step % hvp_every == 0)
 
-        # 5) Final grads
-        proj_Hv = self._expanded_projector_times(Hv, g, g_norm)
+        # 4) Hv + projector term (CONDITIONAL)
+        proj_Hv = None
+
+        if do_hvp:
+            Hv = torch.autograd.grad(
+                g, params,
+                grad_outputs=v,
+                create_graph=False,
+                retain_graph=False,
+                allow_unused=True
+            )
+            Hv = [hvi if hvi is not None else (p * 0.0) for p, hvi in zip(params, Hv)]
+
+            proj_Hv = self._expanded_projector_times(Hv, g, g_norm)
 
         final_grads = []
         idx = 0
@@ -162,12 +172,16 @@ class SAM(torch.optim.Optimizer):
                     continue
 
                 vi = v[idx]
-                proj_i = proj_Hv[idx]
+
+                if proj_Hv is None:
+                    final_grads.append(vi)
+                else:
+                    proj_i = proj_Hv[idx]
+                    final_grads.append(vi + rho * proj_i)
 
                 idx += 1
-                final_grads.append(vi + rho * proj_i)
 
-        # 6) Write grads to real params and step
+        # 5) Write grads to real params and step
         for p, fg in zip(params, final_grads):
             p.grad = fg
 

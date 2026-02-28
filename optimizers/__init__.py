@@ -30,6 +30,7 @@ def configure_samsgd(model, args):
     # [CHANGED]
     optimizer = SAM(
         model, optim.SGD, rho=args.rho, adaptive=args.adaptive,
+        hvp_every=args.hvp_every,
         momentum=0.9,
         lr=args.lr,
         weight_decay=args.weight_decay)
@@ -44,9 +45,11 @@ def configure_samadamw(model, args):
     # [CHANGED]
     optimizer = SAM(
         model, optim.AdamW, rho=args.rho, adaptive=args.adaptive,
+        hvp_every=args.hvp_every,
         betas=tuple(args.betas),
         lr=args.lr,
-        weight_decay=args.weight_decay/args.lr)
+        weight_decay=args.weight_decay/args.lr
+    )
 
     return optimizer, create_graph, two_steps
 
