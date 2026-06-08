@@ -4,6 +4,8 @@ from optimizers.adahessian import Adahessian
 from optimizers.sophiaH import SophiaH
 from optimizers.shampoo import Shampoo
 from optimizers.sassha import SASSHA
+from optimizers.rogdasam import RegularizedOGDASAM  # [NEW]
+from optimizers.rogdasam_then_sam import ROGDASAMThenSAM  # [NEW]
 import torch.optim as optim
 
 def configure_sassha(model, args):
@@ -25,31 +27,33 @@ def configure_sassha(model, args):
 
 def configure_samsgd(model, args):
     create_graph = False
-    two_steps = False  # [CHANGED]
+    two_steps = True
 
-    # [CHANGED]
     optimizer = SAM(
-        model, optim.SGD, rho=args.rho, adaptive=args.adaptive,
-        hvp_every=args.hvp_every,
-        momentum=0.9,
+        model.parameters(),
+        optim.SGD,
+        rho=args.rho,
+        adaptive=args.adaptive,
+        momentum=args.momentum,
         lr=args.lr,
-        weight_decay=args.weight_decay)
+        weight_decay=args.weight_decay
+    )
 
     return optimizer, create_graph, two_steps
 
 
 def configure_samadamw(model, args):
     create_graph = False
-    two_steps = False  # [CHANGED]
+    two_steps = True
 
-    # [CHANGED]
     optimizer = SAM(
-        model, optim.AdamW, rho=args.rho, adaptive=args.adaptive,
-        hvp_every=args.hvp_every,
+        model.parameters(), 
+        optim.AdamW, 
+        rho=args.rho, 
+        adaptive=args.adaptive,
         betas=tuple(args.betas),
         lr=args.lr,
-        weight_decay=args.weight_decay/args.lr
-    )
+        weight_decay=args.weight_decay/args.lr)
 
     return optimizer, create_graph, two_steps
 
@@ -143,6 +147,44 @@ def configure_shampoo(model, args):
 
     return optimizer, create_graph, two_steps
 
+# [NEW]
+def configure_rogdasam(model, args):
+    create_graph = False
+    two_steps = False
+
+    optimizer = RegularizedOGDASAM(
+        model.parameters(),
+        base_optimizer=optim.SGD,
+        lr=args.lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay,
+        rho=args.rho,
+        lambda_val=args.lambda_val,
+        eta_eps=args.eta_eps,
+    )
+
+    return optimizer, create_graph, two_steps
+
+# [NEW]
+def configure_rogdasam_then_sam(model, args):
+    create_graph = False
+    two_steps = False
+
+    optimizer = ROGDASAMThenSAM(
+        model.parameters(),
+        base_optimizer=optim.SGD,
+        rogdasam_epochs=args.rogdasam_epochs,
+        lr=args.lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay,
+        rho=args.rho,
+        lambda_val=args.lambda_val,
+        eta_eps=args.eta_eps,
+        adaptive=args.adaptive,
+    )
+
+    return optimizer, create_graph, two_steps
+
 
 def get_optimizer(model, args):
     optimizer_map = {
@@ -155,6 +197,8 @@ def get_optimizer(model, args):
         'sophiah': configure_sophiah,
         'msassha': configure_msassha,
         'shampoo': configure_shampoo,
+        'rogdasam': configure_rogdasam,  # [NEW]
+        'rogdasam_then_sam': configure_rogdasam_then_sam,  # [NEW]
     }
 
     if args.optimizer not in optimizer_map:

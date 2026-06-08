@@ -227,6 +227,18 @@ def parse_args():
     parser.add_argument("--rho", default=0.05, type=float, help="Rho parameter for sharpness minimization")
     parser.add_argument("--adaptive", default=False, type=bool, help="True if you want to use the Adaptive sharpness")
     parser.add_argument('--project_name', type=str, default='project_name', help="project_name")
+
+    # ROGDASAM settings [NEW]
+    parser.add_argument("--lambda_val", default=0.1, type=float, help="Regularization lambda for ROGDASAM")
+    parser.add_argument("--eta_eps", default=1.0, type=float, help="Epsilon update step size for ROGDASAM")
+    parser.add_argument("--momentum", default=0.9, type=float, help="Momentum for SGD-based optimizers")
+
+    # ROGDASAMThenSam settings [NEW]
+    parser.add_argument("--rogdasam_epochs", type=int, default=5, help="Number of initial epochs to train with ROGDASAM before switching to SAM.")
+
+    # Runtime / safety settings [NEW]
+    parser.add_argument("--gpu_memory_fraction", default=None, type=float, help="Limit CUDA memory fraction per process")
+    parser.add_argument("--dataloader_num_workers", default=2, type=int, help="Number of DataLoader workers")
     
     args = parser.parse_args()
 
@@ -257,6 +269,10 @@ def main():
     set_seed(args.seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+
+    # [NEW]
+    if args.gpu_memory_fraction is not None and torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction, device=0)
 
     # Load Dataset
     if args.task_name is not None:
@@ -407,15 +423,46 @@ def main():
         # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
         data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=None)
 
+    # [CHANGED]
     train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
+        train_dataset,
+        shuffle=True,
+        collate_fn=data_collator,
+        batch_size=args.per_device_train_batch_size,
+        num_workers=args.dataloader_num_workers,
+        pin_memory=torch.cuda.is_available(),
     )
-    eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
 
-    wandb_name = f"{args.task_name}-{args.optimizer}-{args.lr}-{args.weight_decay}-{args.eps}"
+    # [CHANGED]
+    eval_dataloader = DataLoader(
+        eval_dataset,
+        collate_fn=data_collator,
+        batch_size=args.per_device_eval_batch_size,
+        num_workers=args.dataloader_num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    # [CHANGED]
+    wandb_name = (
+        f"{args.task_name}-"
+        f"{args.optimizer}-"
+        f"lr{args.lr}-"
+        f"wd{args.weight_decay}-"
+        f"rho{args.rho}-"
+        f"lambda{args.lambda_val}-"
+        f"eta{args.eta_eps}-"
+        f"rogd_epochs{args.rogdasam_epochs}-"
+        f"seed{args.seed}"
+    )
     
     # get an optimizer
-    optimizer, create_graph, two_steps = get_optimizer(model, args)    
+    optimizer, create_graph, two_steps = get_optimizer(model, args)   
+
+    # [NEW]
+    if args.optimizer in ["samsgd", "samadamw", "rogdasam", "rogdasam_then_sam"] and args.gradient_accumulation_steps != 1:
+        raise ValueError(
+            f"{args.optimizer} currently supports only gradient_accumulation_steps=1 in this training loop."
+        ) 
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -517,6 +564,16 @@ def main():
             completed_steps = resume_step // args.gradient_accumulation_steps
             resume_step -= starting_epoch * len(train_dataloader)
 
+    # [NEW]
+    if args.output_dir is not None:
+        os.makedirs(args.output_dir, exist_ok=True)
+
+        if not args.resume_from_checkpoint:
+            for filename in ["metrics_history.csv", "metrics_history.jsonl", "final_summary.json"]:
+                old_path = os.path.join(args.output_dir, filename)
+                if os.path.exists(old_path):
+                    os.remove(old_path)
+
     # wandb
     wandb_project = args.project_name
     wandb.init(project=wandb_project, name=wandb_name)
@@ -525,7 +582,14 @@ def main():
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
 
+    # [NEW]
+    history = []
+
     for epoch in range(starting_epoch, args.num_train_epochs):
+        # [NEW]
+        if hasattr(optimizer, "set_epoch"):
+            optimizer.set_epoch(epoch)
+
         model.train()
         total_loss = 0
         
@@ -561,33 +625,50 @@ def main():
                         optimizer.zero_grad()
                         
                     elif args.optimizer in ['samsgd', 'samadamw']:
-                        if args.grad_clip_norm != 0:
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                        if args.clip_norm != 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
                         optimizer.second_step(zero_grad=True)
                     
                     lr_scheduler.step()
                     progress_bar.update(1)
                     completed_steps += 1
+                
+            else: # [CHANGED]
+                if args.optimizer in ["rogdasam", "rogdasam_then_sam"]:
+                    def closure():
+                        optimizer.zero_grad()
+                        outputs = model(**batch)
+                        loss = outputs.loss / args.gradient_accumulation_steps
+                        loss.backward()
+                        return loss
 
-            else:
-                outputs = model(**batch)
-                loss = outputs.loss
-                # We keep track of the loss at each epoch
-                total_loss += loss.item()
-                loss = loss / args.gradient_accumulation_steps
-                loss.backward(create_graph=create_graph)
+                    clean_loss = optimizer.step(closure)
+                    total_loss += clean_loss.item() * args.gradient_accumulation_steps
 
-                if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                    
-                    if args.grad_clip_norm != 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
-                    
-                    optimizer.step()
                     optimizer.zero_grad()
                     lr_scheduler.step()
 
                     progress_bar.update(1)
                     completed_steps += 1
+
+                else:
+                    outputs = model(**batch)
+                    loss = outputs.loss
+                    total_loss += loss.item()
+                    loss = loss / args.gradient_accumulation_steps
+                    loss.backward(create_graph=create_graph)
+
+                    if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+
+                        if args.clip_norm != 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
+
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        lr_scheduler.step()
+
+                        progress_bar.update(1)
+                        completed_steps += 1
 
             if completed_steps >= args.max_train_steps:
                 break
@@ -617,6 +698,46 @@ def main():
             "hessian_power": optimizer.hessian_power_t if args.optimizer == 'sassha' else 0,
             })
 
+        ### [NEW]
+        row = {
+            "epoch": epoch,
+            "step": completed_steps,
+            "task_name": args.task_name,
+            "optimizer": args.optimizer,
+            "seed": args.seed,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "rho": args.rho,
+            "lambda_val": args.lambda_val,
+            "eta_eps": args.eta_eps,
+            "momentum": args.momentum,
+            "rogdasam_epochs": args.rogdasam_epochs if args.optimizer == "rogdasam_then_sam" else None,
+            "train_loss": total_loss / len(train_dataloader),
+            "val_loss": val_loss / len(eval_dataloader),
+        }
+
+        for k, v in eval_metric.items():
+            row[f"eval_{k}"] = float(v)
+
+        history.append(row)
+
+        if args.output_dir is not None:
+            import csv
+
+            jsonl_path = os.path.join(args.output_dir, "metrics_history.jsonl")
+            csv_path = os.path.join(args.output_dir, "metrics_history.csv")
+
+            with open(jsonl_path, "a") as f:
+                f.write(json.dumps(row) + "\n")
+
+            write_header = not os.path.exists(csv_path)
+            with open(csv_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
+        ###
+
     if args.task_name == "mnli":
         # Final evaluation on mismatched validation set
         eval_dataset = processed_datasets["validation_mismatched"]
@@ -641,10 +762,42 @@ def main():
             "accuracy-mm" if args.task_name is not None else "glue": eval_metric,
             })
 
+    ### [NEW]
     if args.output_dir is not None:
-        all_results = {f"eval_{k}": v for k, v in eval_metric.items()}
-        with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
-            json.dump(all_results, f)
+        all_results = {
+            "task_name": args.task_name,
+            "optimizer": args.optimizer,
+            "seed": args.seed,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "rho": args.rho,
+            "lambda_val": args.lambda_val,
+            "eta_eps": args.eta_eps,
+            "momentum": args.momentum,
+            "rogdasam_epochs": args.rogdasam_epochs if args.optimizer == "rogdasam_then_sam" else None,
+            "num_train_epochs": args.num_train_epochs,
+            "per_device_train_batch_size": args.per_device_train_batch_size,
+            "final_train_loss": history[-1]["train_loss"] if len(history) else None,
+            "final_val_loss": history[-1]["val_loss"] if len(history) else None,
+        }
+
+        for k, v in eval_metric.items():
+            all_results[f"final_eval_{k}"] = float(v)
+
+        if len(history):
+            metric_keys = [k for k in history[-1].keys() if k.startswith("eval_")]
+            for mk in metric_keys:
+                best_row = max(history, key=lambda r: r[mk])
+                all_results[f"best_{mk}"] = best_row[mk]
+                all_results[f"best_{mk}_epoch"] = best_row["epoch"]
+
+            best_loss_row = min(history, key=lambda r: r["val_loss"])
+            all_results["best_val_loss"] = best_loss_row["val_loss"]
+            all_results["best_val_loss_epoch"] = best_loss_row["epoch"]
+
+        with open(os.path.join(args.output_dir, "final_summary.json"), "w") as f:
+            json.dump(all_results, f, indent=2)
+    ###
 
 
 if __name__ == "__main__":
